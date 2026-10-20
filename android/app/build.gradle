@@ -24,7 +24,7 @@ android {
     }
     defaultConfig {
         applicationId "chat.buku.skate3"
-        minSdkVersion 33
+        minSdkVersion 31
         targetSdkVersion 35
         versionCode 20100
         versionName "2.1.0"

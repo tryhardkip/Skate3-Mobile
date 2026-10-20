@@ -1,0 +1,147 @@
+name: Android APK
+
+on:
+  push:
+    branches: [android12]
+    paths:
+      - "android/**"
+      - "cmake/**"
+      - "CMakeLists.txt"
+      - "CMakePresets.json"
+      - "config/**"
+      - "src/**"
+      - "third_party/**"
+      - ".github/workflows/android-apk.yml"
+  pull_request:
+    paths:
+      - "android/**"
+      - "cmake/**"
+      - "CMakeLists.txt"
+      - "CMakePresets.json"
+      - "config/**"
+      - "src/**"
+      - "third_party/**"
+      - ".github/workflows/android-apk.yml"
+  workflow_dispatch:
+    inputs:
+      title_update_package:
+        description: "URL to a Title Update 3 STFS package (e.g. https://example.com/TU_12K2276...O3)"
+        required: false
+        default: ""
+
+env:
+  NDK_VERSION: "27.2.12479018"
+
+jobs:
+  build-apk:
+    name: Build debug APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android NDK
+        uses: nttg/setup-ndk@1.4.0
+        id: setup-ndk
+        with:
+          ndk-version: ${{ env.NDK_VERSION }}
+          ndk-directory: ${{ github.workspace }}/.ndk-cache
+
+      - name: Set up Android SDK
+        uses: android/setup-android@v4
+        with:
+          platforms: android-35
+          build-tools: 35.0.0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install build tools
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build
+
+      - name: Download Title Update 3 package
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.title_update_package != '' }}
+        run: |
+          set -euo pipefail
+          url="${{ github.event.inputs.title_update_package }}"
+          case "$url" in
+            *.00000000000O3|*O3) name="$(basename "$url")" ;;
+            *) name="TU_12K2276_000000C000000.00000000000O3" ;;
+          esac
+          curl -fL --retry 3 -o "$name" "$url"
+          ls -lh "$name"
+          echo "SKATE3_TITLE_UPDATE_PACKAGE=$(pwd)/$name" >> "$GITHUB_ENV"
+
+      - name: Verify game dump is present
+        run: |
+          set -euo pipefail
+          if [[ ! -f game/default.xex || ! -f game/data/webkit/EAWebkit.xex ]]; then
+            echo "::error::This repository does not contain the extracted Skate 3 game dump (game/default.xex, game/data/webkit/EAWebkit.xex)."
+            echo "::error::Retail game data cannot be redistributed in a public repository."
+            exit 1
+          fi
+
+      - name: Generate code
+        run: |
+          set -euo pipefail
+          export CC=clang CXX=clang++
+          cmake -B build/host -DCMAKE_BUILD_TYPE=RelWithDebInfo \
+            -DSKATE3_GAME_DATA_ROOT="$(pwd)/game" \
+            ${SKATE3_TITLE_UPDATE_PACKAGE:+-DSKATE3_TITLE_UPDATE_PACKAGE="$SKATE3_TITLE_UPDATE_PACKAGE"}
+          cmake --build build/host --target generate-all --parallel
+
+      - name: Build native ARM64 libraries
+        run: |
+          set -euo pipefail
+          export ANDROID_NDK_ROOT="${{ steps.setup-ndk.outputs.ndk-path }}"
+          NDK_DIR="$(cd "$ANDROID_NDK_ROOT" && pwd -P)"
+          cmake -B build/android \
+            -DCMAKE_TOOLCHAIN_FILE="${NDK_DIR}/build/cmake/android.toolchain.cmake" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-31 \
+            -DANDROID_STL=c++_shared \
+            -DCMAKE_C_FLAGS="-O3 -march=armv8-a" \
+            -DCMAKE_CXX_FLAGS="-O3 -march=armv8-a" \
+            -DSKATE3_GAME_DATA_ROOT="$(pwd)/game" \
+            ${SKATE3_TITLE_UPDATE_PACKAGE:+-DSKATE3_TITLE_UPDATE_PACKAGE="$SKATE3_TITLE_UPDATE_PACKAGE"}
+          cmake --build build/android --parallel
+          cxx_shared="$(find "$NDK_DIR/toolchains/llvm/prebuilt" -path '*/sysroot/usr/lib/aarch64-linux-android/libc++_shared.so' -print -quit)"
+          [[ -n "$cxx_shared" ]] || { echo "libc++_shared.so not found in NDK"; exit 1; }
+          mkdir -p android/app/libs/arm64-v8a
+          install -m 0755 build/android/libskate3.so android/app/libs/arm64-v8a/
+          install -m 0755 build/android/librexruntime.so android/app/libs/arm64-v8a/
+          install -m 0755 build/android/third_party/libadrenotools/src/hook/libhook_impl.so android/app/libs/arm64-v8a/
+          install -m 0755 build/android/third_party/libadrenotools/src/hook/libmain_hook.so android/app/libs/arm64-v8a/
+          install -m 0755 "$cxx_shared" android/app/libs/arm64-v8a/
+          ls -lh android/app/libs/arm64-v8a/
+
+      - name: Build Android APK
+        working-directory: android
+        run: |
+          set -euo pipefail
+          ./gradlew --no-daemon --stacktrace assembleDebug
+          ls -lh app/build/outputs/apk/debug/
+
+      - name: Upload APK
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: skate3-mobile-android-debug
+          path: android/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 7
